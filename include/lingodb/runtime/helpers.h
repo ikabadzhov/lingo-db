@@ -1,5 +1,6 @@
 #ifndef LINGODB_RUNTIME_HELPERS_H
 #define LINGODB_RUNTIME_HELPERS_H
+#include "CudaMemory.h"
 #include "ExecutionContext.h"
 
 #include <atomic>
@@ -276,13 +277,13 @@ inline void decRefCount(T* obj, void (*cleanupFn)(T*)) {
 
 template <class T>
 struct LegacyFixedSizedBuffer {
-   LegacyFixedSizedBuffer(size_t size) : ptr((T*) malloc(size * sizeof(T))) {
+   LegacyFixedSizedBuffer(size_t size) : ptr((T*) cudaAllocManaged(size * sizeof(T))) {
       runtime::MemoryHelper::zero((uint8_t*) ptr, size * sizeof(T));
    }
    T* ptr;
    void setNewSize(size_t newSize) {
-      free(ptr);
-      ptr = (T*) malloc(newSize * sizeof(T));
+      cudaFreeManaged(ptr);
+      ptr = (T*) cudaAllocManaged(newSize * sizeof(T));
       runtime::MemoryHelper::zero((uint8_t*) ptr, newSize * sizeof(T));
    }
    T& at(size_t i) {
@@ -292,7 +293,7 @@ struct LegacyFixedSizedBuffer {
       return &ptr[i];
    }
    ~LegacyFixedSizedBuffer() {
-      free(ptr);
+      cudaFreeManaged(ptr);
    }
 };
 
@@ -309,7 +310,7 @@ struct FixedSizedBuffer {
          return (T*) mmap(NULL, elements * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
       } else {
-         auto res = (T*) malloc(elements * sizeof(T));
+         auto res = (T*) cudaAllocManaged(elements * sizeof(T));
          runtime::MemoryHelper::zero((uint8_t*) res, elements * sizeof(T));
          return res;
       }
@@ -318,7 +319,7 @@ struct FixedSizedBuffer {
       if (shouldUseMMAP(elements)) {
          munmap(ptr, elements * sizeof(T));
       } else {
-         free(ptr);
+         cudaFreeManaged(ptr);
       }
    }
 };

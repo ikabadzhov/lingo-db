@@ -1,6 +1,7 @@
 .venv
 .idea
 build/
+bin
 test*.mlir
 test.sql
 resources/data/

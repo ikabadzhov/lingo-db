@@ -438,6 +438,30 @@ std::unique_ptr<lingodb::runtime::Restrictions> lingodb::runtime::Restrictions::
             restrictions->filters.push_back({createSimpleTypeFilter<int64_t, int64_t>(filterDesc.op, filterDesc), colId});
             break;
          }
+         case arrow::Type::FLOAT: {
+            float val = 0.0f;
+            if (std::holds_alternative<double>(filterDesc.value)) {
+               val = static_cast<float>(std::get<double>(filterDesc.value));
+            } else if (std::holds_alternative<int64_t>(filterDesc.value)) {
+               val = static_cast<float>(std::get<int64_t>(filterDesc.value));
+            } else if (std::holds_alternative<std::string>(filterDesc.value)) {
+               val = std::stof(std::get<std::string>(filterDesc.value));
+            }
+            restrictions->filters.push_back({createSimpleTypeSimpleFilters<float>(filterDesc.op, val), colId});
+            break;
+         }
+         case arrow::Type::DOUBLE: {
+            double val = 0.0;
+            if (std::holds_alternative<double>(filterDesc.value)) {
+               val = std::get<double>(filterDesc.value);
+            } else if (std::holds_alternative<int64_t>(filterDesc.value)) {
+               val = static_cast<double>(std::get<int64_t>(filterDesc.value));
+            } else if (std::holds_alternative<std::string>(filterDesc.value)) {
+               val = std::stod(std::get<std::string>(filterDesc.value));
+            }
+            restrictions->filters.push_back({createSimpleTypeSimpleFilters<double>(filterDesc.op, val), colId});
+            break;
+         }
          case arrow::Type::DATE32: {
             if (filterDesc.op == FilterOp::IN) {
                std::vector<int32_t> values;

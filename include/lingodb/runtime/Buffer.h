@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "ExecutionContext.h"
+#include "lingodb/runtime/CudaMemory.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -48,13 +49,13 @@ class FlexibleBuffer {
 
    void nextBuffer() {
       size_t nextCapacity = std::ceil(currCapacity * 1.2);
-      buffers.push_back(Buffer(0, (uint8_t*) malloc(nextCapacity * typeSize)));
+      buffers.push_back(Buffer(0, (uint8_t*) cudaAllocManaged(nextCapacity * typeSize)));
       currCapacity = nextCapacity;
    }
 
    public:
    FlexibleBuffer(size_t initialCapacity, size_t typeSize) : totalLen(0), currCapacity(initialCapacity), typeSize(typeSize) {
-      buffers.push_back(Buffer(0, (uint8_t*) malloc(initialCapacity * typeSize)));
+      buffers.push_back(Buffer(0, (uint8_t*) cudaAllocManaged(initialCapacity * typeSize)));
    }
    uint8_t* insert() {
       if (buffers.back().numElements == currCapacity) {
@@ -99,7 +100,7 @@ class FlexibleBuffer {
    }
    ~FlexibleBuffer() {
       for (auto buf : buffers) {
-         free(buf.ptr);
+         cudaFreeManaged(buf.ptr);
       }
    }
 };

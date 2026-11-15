@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 #include "ConcurrentMap.h"
+#include "CudaMemory.h"
 #include "Session.h"
 #include <lingodb/scheduler/Scheduler.h>
 #ifdef USE_CPYTHON_WASM_RUNTIME
@@ -33,13 +34,13 @@ struct Arena {
    uint8_t* alloc(size_t bytes) {
       //case 1: bytes are larger than threshold, allocate directly
       if (bytes >= thresholdDirectAlloc) {
-         uint8_t* ptr = (uint8_t*) malloc(bytes);
+         uint8_t* ptr = (uint8_t*) cudaAllocManaged(bytes);
          allocations.push_back(ptr);
          return ptr;
       } else {
          if (remainingBytes < bytes) {
             //case 2: not enough space in current chunk, allocate new chunk
-            uint8_t* newChunk = (uint8_t*) malloc(chunkSize);
+            uint8_t* newChunk = (uint8_t*) cudaAllocManaged(chunkSize);
             allocations.push_back(newChunk);
             currentChunkStart = newChunk;
             remainingBytes = chunkSize;
@@ -54,7 +55,7 @@ struct Arena {
 
    ~Arena() {
       for (auto& alloc : allocations) {
-         free(alloc);
+         cudaFreeManaged(alloc);
       }
    }
 };

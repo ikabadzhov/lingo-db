@@ -3011,7 +3011,10 @@ NullableType SQLTypeUtils::getCommonType(NullableType nullableType1, NullableTyp
           type2.getTypeId() == catalog::LogicalTypeId::INT) {
          return NullableType(type1, isNullable);
       }
-      if ((type1.getTypeId() == catalog::LogicalTypeId::INT || type1.getTypeId() == catalog::LogicalTypeId::DECIMAL) && type2.getTypeId() == catalog::LogicalTypeId::DOUBLE) {
+      if ((type1.getTypeId() == catalog::LogicalTypeId::INT || type1.getTypeId() == catalog::LogicalTypeId::DECIMAL) && (type2.getTypeId() == catalog::LogicalTypeId::DOUBLE || type2.getTypeId() == catalog::LogicalTypeId::FLOAT)) {
+         return NullableType(type2, isNullable);
+      }
+      if (type1.getTypeId() == catalog::LogicalTypeId::FLOAT && type2.getTypeId() == catalog::LogicalTypeId::DOUBLE) {
          return NullableType(type2, isNullable);
       }
 

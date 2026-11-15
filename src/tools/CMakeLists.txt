@@ -57,3 +57,10 @@ add_executable(run-sql run-sql.cpp)
 target_link_libraries(run-sql PUBLIC ${COMMON_LIBS})
 set_target_properties(run-sql PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_definitions(run-sql PRIVATE ${COMPILE_DEFS})
+
+# sql-test
+add_executable(sql-test sql-test.cpp)
+target_link_libraries(sql-test PRIVATE ${COMMON_LIBS} Parquet::parquet_static)
+set_target_properties(sql-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_definitions(sql-test PRIVATE ${COMPILE_DEFS})
+

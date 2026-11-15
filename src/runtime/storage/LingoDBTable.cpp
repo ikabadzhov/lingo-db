@@ -11,20 +11,111 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 #include <arrow/table.h>
+#include <parquet/arrow/reader.h>
+#include "lingodb/runtime/CudaMemory.h"
+
 
 #include <algorithm>
+#include <dlfcn.h>
 #include <filesystem>
 #include <iostream>
 #include <random>
 #include <ranges>
 #include <shared_mutex>
 namespace {
+using namespace lingodb::runtime;
 namespace utility = lingodb::utility;
 static utility::Tracer::Event processMorsel("TableScan", "morsel", false);
 
 static utility::Tracer::Event processMorselSingle("TableScan", "single morsel", false);
 
+class CudaManagedMemoryPool : public arrow::MemoryPool {
+   static constexpr uint64_t MAGIC = 0xCAFEBABEDEADF00DULL;
+public:
+   CudaManagedMemoryPool() = default;
+
+   arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
+      size_t actualAlignment = std::max(static_cast<size_t>(alignment), static_cast<size_t>(64));
+      size_t actualSize = size + actualAlignment;
+      void* ptr = cudaAllocManaged(actualSize);
+      if (ptr) {
+         uint64_t* header = reinterpret_cast<uint64_t*>(ptr);
+         header[0] = MAGIC;
+         header[1] = actualAlignment;
+         *out = reinterpret_cast<uint8_t*>(ptr) + actualAlignment;
+         return arrow::Status::OK();
+      }
+      return arrow::default_memory_pool()->Allocate(size, alignment, out);
+   }
+
+   arrow::Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment, uint8_t** ptr) override {
+      uint8_t* new_ptr = nullptr;
+      auto st = Allocate(new_size, alignment, &new_ptr);
+      if (!st.ok()) return st;
+      if (*ptr && old_size > 0) {
+         memcpy(new_ptr, *ptr, std::min(old_size, new_size));
+      }
+      Free(*ptr, old_size, alignment);
+      *ptr = new_ptr;
+      return arrow::Status::OK();
+   }
+
+   void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
+      if (!buffer) return;
+      size_t actualAlignment = std::max(static_cast<size_t>(alignment), static_cast<size_t>(64));
+      void* originalPtr = buffer - actualAlignment;
+      uint64_t* header = reinterpret_cast<uint64_t*>(originalPtr);
+      if (header[0] == MAGIC) {
+         header[0] = 0;
+         cudaFreeManaged(originalPtr);
+         return;
+      }
+      arrow::default_memory_pool()->Free(buffer, size, alignment);
+   }
+
+   int64_t bytes_allocated() const override { return 0; }
+   int64_t max_memory() const override { return 0; }
+   int64_t total_bytes_allocated() const override { return 0; }
+   int64_t num_allocations() const override { return 0; }
+   std::string backend_name() const override { return "cuda_managed"; }
+};
+
+static arrow::MemoryPool* getCudaManagedMemoryPool() {
+   static CudaManagedMemoryPool pool;
+   return &pool;
+}
+
 std::vector<lingodb::runtime::LingoDBTable::TableChunk> loadTable(std::string name) {
+   if (name.ends_with(".parquet")) {
+      auto inputFileRes = arrow::io::ReadableFile::Open(name);
+      if (!inputFileRes.ok()) {
+         throw std::runtime_error("Could not open parquet file: " + name + " (" + inputFileRes.status().ToString() + ")");
+      }
+      auto inputFile = inputFileRes.ValueOrDie();
+      auto readerRes = parquet::arrow::OpenFile(inputFile, getCudaManagedMemoryPool());
+      if (!readerRes.ok()) {
+         throw std::runtime_error("Could not open parquet reader: " + readerRes.status().ToString());
+      }
+      auto reader = std::move(readerRes).ValueOrDie();
+      reader->set_use_threads(true);
+
+      std::shared_ptr<arrow::Table> table;
+      auto st = reader->ReadTable(&table);
+      if (!st.ok() || !table) {
+         throw std::runtime_error("Failed to read parquet table: " + st.ToString());
+      }
+
+      std::vector<lingodb::runtime::LingoDBTable::TableChunk> chunks;
+      arrow::TableBatchReader batchReader(*table);
+      batchReader.set_chunksize(65536);
+      std::shared_ptr<arrow::RecordBatch> batch;
+      size_t currRowId = 0;
+      while (batchReader.ReadNext(&batch).ok() && batch) {
+         chunks.emplace_back(batch, currRowId);
+         currRowId += batch->num_rows();
+      }
+      return chunks;
+   }
    auto inputFile = arrow::io::ReadableFile::Open(name).ValueOrDie();
    auto batchReader = arrow::ipc::RecordBatchFileReader::Open(inputFile).ValueOrDie();
    std::vector<lingodb::runtime::LingoDBTable::TableChunk> batches;
@@ -83,13 +174,17 @@ std::shared_ptr<arrow::RecordBatch> createSample(const std::vector<lingodb::runt
       return std::shared_ptr<arrow::RecordBatch>();
    }
    std::vector<size_t> result;
-
+   size_t sampleCount = std::min<size_t>(numRows, 1024ull);
+   result.reserve(sampleCount);
    auto rng = std::mt19937{std::random_device{}()};
-
-   // sample five values without replacement from [1, 100]
-   std::sample(
-      BoxedIntegerIterator<size_t>{0l}, BoxedIntegerIterator<size_t>{numRows},
-      std::back_inserter(result), std::min<size_t>(numRows, 1024ull), rng);
+   std::uniform_int_distribution<size_t> dist(0, numRows - 1);
+   std::unordered_set<size_t> picked;
+   while (result.size() < sampleCount) {
+      size_t idx = dist(rng);
+      if (picked.insert(idx).second) {
+         result.push_back(idx);
+      }
+   }
    std::sort(result.begin(), result.end());
    size_t currPos = 0;
    size_t currBatch = 0;
@@ -294,13 +389,31 @@ std::shared_ptr<arrow::DataType> LingoDBTable::getColumnStorageType(std::string_
 void LingoDBTable::ensureLoaded() {
    if (!loaded) {
       loaded = true;
-      if (fileName.empty() || dbDir.empty()) {
+      if (fileName.empty() && dbDir.empty()) {
          return;
       }
-      if (!std::filesystem::exists(dbDir + "/" + fileName)) {
+      auto fsPath = dbDir.empty() ? std::filesystem::path(fileName) : (std::filesystem::path(dbDir) / fileName);
+      if (!std::filesystem::exists(fsPath)) {
+         if (fileName.ends_with(".arrow")) {
+            auto alt = fsPath;
+            alt.replace_extension(".parquet");
+            if (std::filesystem::exists(alt)) {
+               fsPath = alt;
+            }
+         }
+      }
+      if (!std::filesystem::exists(fsPath)) {
          return;
       }
-      tableData = loadTable(dbDir + "/" + fileName);
+      tableData = loadTable(fsPath.string());
+      if (numRows == 0) {
+         for (const auto& chunk : tableData) {
+            numRows += chunk.getNumRows();
+         }
+      }
+      if (numRows > 0 && (!sample.getSampleData() || sample.getSampleData()->num_rows() == 0)) {
+         sample = createSample(tableData);
+      }
    }
 }
 void LingoDBTable::serialize(lingodb::utility::Serializer& serializer) const {
@@ -375,7 +488,9 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
          batchInfos.emplace_back(lingodb::runtime::BatchView());
          arrayViewPtrs.emplace_back(std::vector<const ArrayView*>(colIds.size()));
          batchInfos[i].arrays = arrayViewPtrs[i].data();
-         selVecs.emplace_back(std::make_pair(new uint16_t[splitSize], new uint16_t[splitSize]));
+         auto* s1 = reinterpret_cast<uint16_t*>(cudaAllocManaged(splitSize * sizeof(uint16_t)));
+         auto* s2 = reinterpret_cast<uint16_t*>(cudaAllocManaged(splitSize * sizeof(uint16_t)));
+         selVecs.emplace_back(std::make_pair(s1, s2));
          workerResvs.emplace_back(std::make_unique<BatchesWorkerResvState>());
       }
    }
@@ -463,8 +578,8 @@ class ScanBatchesTask : public lingodb::scheduler::TaskWithImplicitContext {
    }
    ~ScanBatchesTask() {
       for (auto& selVec : selVecs) {
-         delete[] selVec.first;
-         delete[] selVec.second;
+         cudaFreeManaged(selVec.first);
+         cudaFreeManaged(selVec.second);
       }
    }
 };
@@ -502,8 +617,8 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
       batchView.arrays = arrayViewPtrs.data();
       batchView.offset = 0;
       batchView.length = 0;
-      uint16_t* selVec1 = new uint16_t[BatchView::maxBatchSize];
-      uint16_t* selVec2 = new uint16_t[BatchView::maxBatchSize];
+      uint16_t* selVec1 = reinterpret_cast<uint16_t*>(cudaAllocManaged(BatchView::maxBatchSize * sizeof(uint16_t)));
+      uint16_t* selVec2 = reinterpret_cast<uint16_t*>(cudaAllocManaged(BatchView::maxBatchSize * sizeof(uint16_t)));
 
       for (auto& batch : batches) {
          utility::Tracer::Trace trace(processMorselSingle);
@@ -524,8 +639,8 @@ class ScanBatchesSingleThreadedTask : public lingodb::scheduler::TaskWithImplici
          }
          trace.stop();
       }
-      delete[] selVec1;
-      delete[] selVec2;
+      cudaFreeManaged(selVec1);
+      cudaFreeManaged(selVec2);
    }
    ~ScanBatchesSingleThreadedTask() {
    }

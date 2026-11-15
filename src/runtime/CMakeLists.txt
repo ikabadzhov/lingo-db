@@ -50,9 +50,9 @@ target_compile_definitions(runtime PUBLIC ${COMPILE_DEFS})
 
 #todo: should not be necessary, but it is for Arrow 23
 if("abslAlt" IN_LIST ARROW_SYSTEM_DEPENDENCIES)
-    target_link_libraries(runtime PRIVATE Arrow::arrow_static absl::strings absl::time absl::bad_optional_access)
+    target_link_libraries(runtime PRIVATE Arrow::arrow_static Parquet::parquet_static absl::strings absl::time absl::bad_optional_access)
 else()
-    target_link_libraries(runtime PRIVATE Arrow::arrow_static)
+    target_link_libraries(runtime PRIVATE Arrow::arrow_static Parquet::parquet_static)
 endif()
 
 
