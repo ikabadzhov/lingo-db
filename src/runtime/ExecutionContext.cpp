@@ -1,4 +1,5 @@
 #include "lingodb/runtime/ExecutionContext.h"
+#include "lingodb/runtime/CudaMemory.h"
 #include "lingodb/runtime/PythonRuntime.h"
 #ifdef USE_CPYTHON_RUNTIME
 #include "Python.h"
@@ -42,8 +43,8 @@ lingodb::runtime::ExecutionContext::~ExecutionContext() {
 uint8_t* lingodb::runtime::ExecutionContext::allocStateRaw(size_t size) {
    auto* context = getCurrentExecutionContext();
    assert(context);
-   uint8_t* ptr = static_cast<uint8_t*>(malloc(size));
-   context->registerState({ptr, [](void* p) { free(p); }});
+   uint8_t* ptr = static_cast<uint8_t*>(cudaAllocManaged(size));
+   context->registerState({ptr, [](void* p) { cudaFreeManaged(p); }});
    return ptr;
 }
 

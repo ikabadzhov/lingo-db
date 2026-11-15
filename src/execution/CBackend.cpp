@@ -11,6 +11,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 
+#include <atomic>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -20,8 +21,35 @@
 #include "dlfcn.h"
 #include "unistd.h"
 
+#include <sstream>
+
 namespace {
-lingodb::utility::GlobalSetting<std::string> cBackendCompilerDriver("system.compilation.c_backend_compiler_driver", "c++");
+static std::string getDefaultCompilerDriver() {
+   if (const char* envAcpp = std::getenv("ACPP_BIN")) {
+      if (std::filesystem::exists(envAcpp)) {
+         return envAcpp;
+      }
+   }
+   if (const char* envAcppDir = std::getenv("ACPP_DIR")) {
+      auto p = std::filesystem::path(envAcppDir) / "bin" / "acpp";
+      if (std::filesystem::exists(p)) {
+         return p.string();
+      }
+   }
+   const char* pathEnv = std::getenv("PATH");
+   if (pathEnv) {
+      std::stringstream ss(pathEnv);
+      std::string dir;
+      while (std::getline(ss, dir, ':')) {
+         auto p = std::filesystem::path(dir) / "acpp";
+         if (std::filesystem::exists(p)) {
+            return p.string();
+         }
+      }
+   }
+   return "c++";
+}
+lingodb::utility::GlobalSetting<std::string> cBackendCompilerDriver("system.compilation.c_backend_compiler_driver", getDefaultCompilerDriver());
 
 class DefaultCBackend : public lingodb::execution::ExecutionBackend {
    void execute(mlir::ModuleOp& moduleOp, lingodb::runtime::ExecutionContext* executionContext) override {
@@ -37,11 +65,19 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
 
       translatedModule = std::regex_replace(translatedModule, r, "extern \"C\" void mainFunc() {");
 
-      std::ofstream outputFile(currPath + "/mlir-c-module.cpp");
-      outputFile << "#include<cstdint>\n"
-                    "#include<tuple>\n"
-                    "#include<bit>\n"
-                    "#include<math.h>\n"
+      static std::atomic<uint64_t> moduleCounter{0};
+      uint64_t modId = moduleCounter.fetch_add(1);
+      std::string baseName = "c-backend-" + std::to_string(getpid()) + "-" + std::to_string(modId);
+      std::string cppPath = currPath + "/" + baseName + ".cpp";
+      std::string soPath = currPath + "/" + baseName + ".so";
+
+      std::ofstream outputFile(cppPath);
+      outputFile << "#include <pcuda.hpp>\n"
+                    "#include <cuda_runtime.h>\n"
+                    "#include <cstdint>\n"
+                    "#include <tuple>\n"
+                    "#include <bit>\n"
+                    "#include <math.h>\n"
                     "#include \"lingodb/runtime/helpers.h\"\n"
                     "#include \"lingodb/runtime/Buffer.h\"\n"
                     "namespace runtime=lingodb::runtime;\n"
@@ -50,16 +86,86 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
                     "struct make_unsigned<__int128> {\n"
                     "   typedef __uint128_t type;\n"
                     "};\n"
-                    "}"
-                    "size_t hash_64(size_t val){\n"
+                    "}\n"
+                    "template <typename T>\n"
+                    "inline __device__ __host__ std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8, T>\n"
+                    "atomicCAS(T* address, T compare, T val) {\n"
+                    "#if defined(__CUDA_ARCH__) || defined(__ACPP_DEVICE_CODE__)\n"
+                    "   unsigned long long expected = static_cast<unsigned long long>(compare);\n"
+                    "   unsigned long long desired = static_cast<unsigned long long>(val);\n"
+                    "   unsigned long long old = atomicCAS(reinterpret_cast<unsigned long long int*>(address), expected, desired);\n"
+                    "   return static_cast<T>(old);\n"
+                    "#else\n"
+                    "   T expected = compare;\n"
+                    "   __atomic_compare_exchange_n(address, &expected, val, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);\n"
+                    "   return expected;\n"
+                    "#endif\n"
+                    "}\n"
+                    "template <typename T, typename U>\n"
+                    "inline __device__ __host__ std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8, T>\n"
+                    "atomicAdd(T* address, U val) {\n"
+                    "#if defined(__CUDA_ARCH__) || defined(__ACPP_DEVICE_CODE__)\n"
+                    "   return static_cast<T>(atomicAdd(reinterpret_cast<unsigned long long int*>(address), static_cast<unsigned long long int>(val)));\n"
+                    "#else\n"
+                    "   return static_cast<T>(__atomic_fetch_add(address, static_cast<T>(val), __ATOMIC_SEQ_CST));\n"
+                    "#endif\n"
+                    "}\n"
+                    "template <typename T, typename U>\n"
+                    "inline __device__ __host__ std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 4, T>\n"
+                    "atomicAdd(T* address, U val) {\n"
+                    "#if defined(__CUDA_ARCH__) || defined(__ACPP_DEVICE_CODE__)\n"
+                    "   return static_cast<T>(atomicAdd(reinterpret_cast<int*>(address), static_cast<int>(val)));\n"
+                    "#else\n"
+                    "   return static_cast<T>(__atomic_fetch_add(address, static_cast<T>(val), __ATOMIC_SEQ_CST));\n"
+                    "#endif\n"
+                    "}\n"
+                    "template <typename T, typename U>\n"
+                    "inline __device__ __host__ std::enable_if_t<std::is_floating_point_v<T>, T>\n"
+                    "atomicAdd(T* address, U val) {\n"
+                    "#if defined(__CUDA_ARCH__) || defined(__ACPP_DEVICE_CODE__)\n"
+                    "   return atomicAdd(address, static_cast<T>(val));\n"
+                    "#else\n"
+                    "   T current = *address;\n"
+                    "   while (!__atomic_compare_exchange_n(address, &current, current + static_cast<T>(val), true, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}\n"
+                    "   return current;\n"
+                    "#endif\n"
+                    "}\n"
+                    "template <typename T, typename U>\n"
+                    "inline __device__ __host__ std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8, T>\n"
+                    "atomicOr(T* address, U val) {\n"
+                    "#if defined(__CUDA_ARCH__) || defined(__ACPP_DEVICE_CODE__)\n"
+                    "   return static_cast<T>(atomicOr(reinterpret_cast<unsigned long long int*>(address), static_cast<unsigned long long int>(val)));\n"
+                    "#else\n"
+                    "   return static_cast<T>(__atomic_fetch_or(address, static_cast<T>(val), __ATOMIC_SEQ_CST));\n"
+                    "#endif\n"
+                    "}\n"
+                    "template <typename T, typename U>\n"
+                    "inline __device__ __host__ std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 4, T>\n"
+                    "atomicOr(T* address, U val) {\n"
+                    "#if defined(__CUDA_ARCH__) || defined(__ACPP_DEVICE_CODE__)\n"
+                    "   return static_cast<T>(atomicOr(reinterpret_cast<int*>(address), static_cast<int>(val)));\n"
+                    "#else\n"
+                    "   return static_cast<T>(__atomic_fetch_or(address, static_cast<T>(val), __ATOMIC_SEQ_CST));\n"
+                    "#endif\n"
+                    "}\n"
+                    "inline __device__ __host__ size_t hash_64(size_t val){\n"
                     "\tsize_t p1=11400714819323198549ull;\n"
                     "\tsize_t m1=val*p1;\n"
                     "\treturn m1 ^ __builtin_bswap64(m1);\n"
-                    "}"
-                    "size_t hash_combine(size_t h1, size_t h2){\n"
+                    "}\n"
+                    "inline __device__ __host__ size_t hash_combine(size_t h1, size_t h2){\n"
                     "\treturn h2 ^ __builtin_bswap64(h1);\n"
                     "}\n"
-                    "extern \"C\" size_t hashVarLenData(runtime::VarLen32);\n"
+                    "inline __device__ __host__ size_t hashVarLenData(runtime::VarLen32 str) {\n"
+                    "   uint32_t len = str.getLen();\n"
+                    "   const uint8_t* ptr = str.getPtr();\n"
+                    "   uint64_t h = 14695981039346656037ull;\n"
+                    "   for (uint32_t i = 0; i < len; ++i) {\n"
+                    "      h ^= ptr[i];\n"
+                    "      h *= 1099511628211ull;\n"
+                    "   }\n"
+                    "   return static_cast<size_t>(h);\n"
+                    "}\n"
                     "alignas(4096) uint16_t lingodb::runtime::bloomMasks[2048]={\n"
                     "// The 1820 distinct bit-patterns\n"
                     "   15, 23, 27, 29, 30, 39, 43, 45, 46, 51, 53, 54, 57, 58, 60, 71, 75, 77, 78, 83, 85, 86, 89, 90, 92, 99, 101, 102, 105, 106, 108, 113, 114, 116, 120, 135, 139, 141, 142, 147, 149, 150, 153, 154, 156, 163, 165, 166, 169, 170, 172, 177, 178, 180, 184, 195, 197, 198, 201, 202, 204, 209, 210, 212, 216, 225, 226, 228, 232, 240, 263, 267, 269, 270, 275, 277, 278, 281, 282, 284, 291, 293, 294, 297, 298, 300, 305, 306, 308, 312, 323, 325, 326, 329, 330, 332, 337, 338, 340, 344, 353, 354, 356, 360, 368, 387, 389, 390, 393, 394, 396, 401, 402, 404, 408, 417, 418, 420, 424, 432, 449, 450, 452, 456, 464, 480, 519, 523,\n"
@@ -85,17 +191,71 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
                  << std::endl;
       outputFile << translatedModule << std::endl;
       outputFile.close();
+      try {
+         std::filesystem::copy_file(cppPath, currPath + "/mlir-c-module.cpp", std::filesystem::copy_options::overwrite_existing);
+      } catch (...) {}
       usleep(20000);
 
+      std::string compiler = cBackendCompilerDriver.getValue();
+      std::string cmd;
+      if (compiler.find("acpp") != std::string::npos) {
+         std::string acppIncludeFlags;
+         std::filesystem::path acppPrefix;
+         if (const char* envDir = std::getenv("ACPP_DIR")) {
+            acppPrefix = envDir;
+         } else if (const char* envBin = std::getenv("ACPP_BIN")) {
+            acppPrefix = std::filesystem::path(envBin).parent_path().parent_path();
+         } else {
+            std::filesystem::path compPath(compiler);
+            if (compPath.is_absolute() && std::filesystem::exists(compPath)) {
+               acppPrefix = compPath.parent_path().parent_path();
+            } else {
+               const char* pathEnv = std::getenv("PATH");
+               if (pathEnv) {
+                  std::stringstream ss(pathEnv);
+                  std::string dir;
+                  while (std::getline(ss, dir, ':')) {
+                     auto p = std::filesystem::path(dir) / compiler;
+                     if (std::filesystem::exists(p)) {
+                        acppPrefix = std::filesystem::canonical(p).parent_path().parent_path();
+                        break;
+                     }
+                  }
+               }
+            }
+         }
+         if (!acppPrefix.empty()) {
+            auto inc = acppPrefix / "include";
+            if (std::filesystem::exists(inc)) {
+               acppIncludeFlags += "-I " + inc.string() + " ";
+            }
+            auto incAdapt = inc / "AdaptiveCpp";
+            if (std::filesystem::exists(incAdapt)) {
+               acppIncludeFlags += "-I " + incAdapt.string() + " ";
+            }
+            auto incPcuda1 = incAdapt / "AdaptiveCpp" / "pcuda";
+            if (std::filesystem::exists(incPcuda1)) {
+               acppIncludeFlags += "-I " + incPcuda1.string() + " ";
+            }
+            auto incPcuda2 = incAdapt / "pcuda";
+            if (std::filesystem::exists(incPcuda2)) {
+               acppIncludeFlags += "-I " + incPcuda2.string() + " ";
+            }
+         }
+         cmd = compiler + " --acpp-targets=generic --acpp-pcuda --acpp-pcuda-chevron-launch -fdeclspec -shared -O3 -fPIC -std=c++20 "
+               + acppIncludeFlags + "-I " + std::string(SOURCE_DIR) + "/include " + cppPath + " -o " + soPath + " 2>&1";
+      } else {
 #ifdef __APPLE__
-      std::string cmd = cBackendCompilerDriver.getValue() + std::string(" -march=native -shared -O0 -g -gdwarf-4 -fPIC -Wl,-export_dynamic -x c++ -std=c++20 -Wno-invalid-partial-specialization -Wno-invalid-specialization -I ") + std::string(SOURCE_DIR) + "/include " + currPath + "/mlir-c-module.cpp -o " + currPath + "/c-backend.so";
+         cmd = compiler + std::string(" -march=native -shared -O3 -fPIC -Wl,-export_dynamic -x c++ -std=c++20 -Wno-invalid-partial-specialization -Wno-invalid-specialization -I ") + std::string(SOURCE_DIR) + "/include " + cppPath + " -o " + soPath + " 2>&1";
 #else
-      std::string cmd = cBackendCompilerDriver.getValue() + std::string(" -march=native -shared -O0 -g -gdwarf-4 -fPIC -Wl,--export-dynamic -x c++ -std=c++20 -I ") + std::string(SOURCE_DIR) + "/include " + currPath + "/mlir-c-module.cpp -o " + currPath + "/c-backend.so";
+         cmd = compiler + std::string(" -march=native -shared -O3 -fPIC -Wl,--export-dynamic -x c++ -std=c++20 -I ") + std::string(SOURCE_DIR) + "/include " + cppPath + " -o " + soPath + " 2>&1";
 #endif
+      }
 
       auto* pPipe = ::popen(cmd.c_str(), "r");
       if (pPipe == nullptr) {
          error.emit() << "Could not compile query module statically (Pipe could not be opened)";
+         std::filesystem::remove(cppPath);
          return;
       }
       std::array<char, 256> buffer;
@@ -106,13 +266,16 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
       }
       auto rc = ::pclose(pPipe);
       if (WEXITSTATUS(rc)) {
-         error.emit() << "Could not compile query module statically (Pipe could not be closed)";
+         error.emit() << "Could not compile query module statically:\n" << result;
+         std::filesystem::remove(cppPath);
          return;
       }
-      void* handle = dlopen(std::string(currPath + "/c-backend.so").c_str(), RTLD_LAZY);
+      void* handle = dlopen(soPath.c_str(), RTLD_LAZY);
       const char* dlsymError = dlerror();
       if (dlsymError) {
-         error.emit() << "Can not open static library: " << std::string(dlsymError) << "\nerror:" << result << std::endl;
+         error.emit() << "Can not open static library: " << std::string(dlsymError) << "\nerror:\n" << result << std::endl;
+         std::filesystem::remove(cppPath);
+         std::filesystem::remove(soPath);
          return;
       }
       auto mainFunc = reinterpret_cast<lingodb::execution::mainFnType>(dlsym(handle, "mainFunc"));
@@ -120,10 +283,16 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
       if (dlsymError) {
          error.emit() << "Could not load symbol for main function: " << std::string(dlsymError);
          dlclose(handle);
+         std::filesystem::remove(cppPath);
+         std::filesystem::remove(soPath);
          return;
       }
       mainFunc();
-      dlclose(handle);
+      // Note: Do not dlclose(handle) because AdaptiveCpp registers runtime kernel descriptors
+      // and asynchronous queues that must remain valid for subsequent kernel calls.
+      // The shared library has a unique path per query (modId), so each query gets its own handle.
+      std::filesystem::remove(cppPath);
+      std::filesystem::remove(soPath);
    }
 };
 } // namespace

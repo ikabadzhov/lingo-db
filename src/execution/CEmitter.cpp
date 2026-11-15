@@ -185,6 +185,8 @@ struct CppEmitter {
    bool shouldDeclareVariablesAtTop() { return declareVariablesAtTop; };
    bool shouldLeaveFunctionsUnresolved() { return leaveFunctionsUnresolved; }
    std::string& getStructDefs() { return structDefs; }
+   bool isInParallelLoop() const { return inParallelLoop; }
+   void setInParallelLoop(bool val) { inParallelLoop = val; }
 
    private:
    using ValueMapper = llvm::ScopedHashTable<Value, std::string>;
@@ -198,6 +200,7 @@ struct CppEmitter {
    /// includes results from ops located in nested regions.
    bool declareVariablesAtTop;
    bool leaveFunctionsUnresolved;
+   bool inParallelLoop = false;
 
    /// Map from value to name of C++ variable that contain the name.
    ValueMapper valueMapper;
@@ -418,13 +421,10 @@ LogicalResult printOperation(CppEmitter& emitter, util::ToMemrefOp op) {
 LogicalResult printOperation(CppEmitter& emitter, memref::AtomicRMWOp op) {
    assert(op.getKind() == mlir::arith::AtomicRMWKind::addf || op.getKind() == mlir::arith::AtomicRMWKind::addi || op.getKind() == mlir::arith::AtomicRMWKind::ori);
    return printStandardOperation(emitter, op, [&](auto& os) {
-      os << "std::atomic_ref<";
-      auto s = emitter.emitType(op.getLoc(), op.getValue().getType()).succeeded();
-      assert(s);
       if (op.getKind() == mlir::arith::AtomicRMWKind::addf || op.getKind() == mlir::arith::AtomicRMWKind::addi) {
-         os << ">(*" << emitter.getOrCreateName(op.getMemref()) << ").fetch_add(" << emitter.getOrCreateName(op.getValue()) << ")";
+         os << "atomicAdd(" << emitter.getOrCreateName(op.getMemref()) << ", " << emitter.getOrCreateName(op.getValue()) << ")";
       } else {
-         os << ">(*" << emitter.getOrCreateName(op.getMemref()) << ").fetch_or(" << emitter.getOrCreateName(op.getValue()) << ")";
+         os << "atomicOr(" << emitter.getOrCreateName(op.getMemref()) << ", " << emitter.getOrCreateName(op.getValue()) << ")";
       }
    });
 }
@@ -574,6 +574,62 @@ LogicalResult printOperation(CppEmitter& emitter, util::LoadElementOp op) {
 }
 LogicalResult printOperation(CppEmitter& emitter, util::StoreElementOp op) {
    raw_ostream& os = emitter.ostream();
+   if (emitter.isInParallelLoop()) {
+      Value val = op.getVal();
+      Value delta;
+      if (auto* defOp = val.getDefiningOp()) {
+         if (auto selectOp = dyn_cast<arith::SelectOp>(defOp)) {
+            Value falseVal = selectOp.getFalseValue();
+            if (auto* addOpDef = falseVal.getDefiningOp()) {
+               if (auto addf = dyn_cast<arith::AddFOp>(addOpDef)) {
+                  if (auto load = dyn_cast_or_null<util::LoadElementOp>(addf.getLhs().getDefiningOp())) {
+                     if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                        delta = addf.getRhs();
+                     }
+                  } else if (auto load = dyn_cast_or_null<util::LoadElementOp>(addf.getRhs().getDefiningOp())) {
+                     if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                        delta = addf.getLhs();
+                     }
+                  }
+               } else if (auto addi = dyn_cast<arith::AddIOp>(addOpDef)) {
+                  if (auto load = dyn_cast_or_null<util::LoadElementOp>(addi.getLhs().getDefiningOp())) {
+                     if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                        delta = addi.getRhs();
+                     }
+                  } else if (auto load = dyn_cast_or_null<util::LoadElementOp>(addi.getRhs().getDefiningOp())) {
+                     if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                        delta = addi.getLhs();
+                     }
+                  }
+               }
+            }
+         } else if (auto addf = dyn_cast<arith::AddFOp>(defOp)) {
+            if (auto load = dyn_cast_or_null<util::LoadElementOp>(addf.getLhs().getDefiningOp())) {
+               if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                  delta = addf.getRhs();
+               }
+            } else if (auto load = dyn_cast_or_null<util::LoadElementOp>(addf.getRhs().getDefiningOp())) {
+               if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                  delta = addf.getLhs();
+               }
+            }
+         } else if (auto addi = dyn_cast<arith::AddIOp>(defOp)) {
+            if (auto load = dyn_cast_or_null<util::LoadElementOp>(addi.getLhs().getDefiningOp())) {
+               if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                  delta = addi.getRhs();
+               }
+            } else if (auto load = dyn_cast_or_null<util::LoadElementOp>(addi.getRhs().getDefiningOp())) {
+               if (load.getRef() == op.getRef() && load.getIdx() == op.getIdx()) {
+                  delta = addi.getLhs();
+               }
+            }
+         }
+      }
+      if (delta) {
+         os << "atomicAdd(&(" << emitter.getOrCreateName(op.getRef()) << "->t" << op.getIdx() << "), " << emitter.getOrCreateName(delta) << ")";
+         return success();
+      }
+   }
    os << emitter.getOrCreateName(op.getRef()) << "->t" << op.getIdx() << " = " << emitter.getOrCreateName(op.getVal());
    return success();
 }
@@ -655,6 +711,56 @@ LogicalResult printOperation(CppEmitter& emitter, scf::ForOp forOp) {
       os << " " << emitter.getOrCreateName(std::get<0>(pair)) << " = ";
       os << emitter.getOrCreateName(std::get<1>(pair)) << ";";
       os << "\n";
+   }
+
+   bool canRunOnGPU = !emitter.isInParallelLoop() && iterArgs.empty();
+   if (canRunOnGPU) {
+      forOp.walk([&](Operation* nestedOp) {
+         if (isa<func::CallOp, func::CallIndirectOp>(nestedOp)) {
+            canRunOnGPU = false;
+         }
+      });
+   }
+
+   if (canRunOnGPU) {
+      std::string ivName = emitter.getOrCreateName(forOp.getInductionVar()).str();
+      std::string lbName = emitter.getOrCreateName(forOp.getLowerBound()).str();
+      std::string ubName = emitter.getOrCreateName(forOp.getUpperBound()).str();
+      std::string stepName = emitter.getOrCreateName(forOp.getStep()).str();
+
+      os << "{\n";
+      os.indent();
+      os << "size_t __total_rows = (" << ubName << " > " << lbName << ") ? (size_t)(" << ubName << " - " << lbName << ") : 0;\n";
+      os << "if (__total_rows > 0) {\n";
+      os.indent();
+      os << "int __block_size = 256;\n";
+      os << "int __num_blocks = (__total_rows + __block_size - 1) / __block_size;\n";
+      os << "pcudaParallelFor(__num_blocks, __block_size, [=] __device__ () {\n";
+      os.indent();
+      os << "size_t __gid = (size_t)(threadIdx.x + blockIdx.x * blockDim.x);\n";
+      os << "if (__gid < __total_rows) {\n";
+      os.indent();
+      os << "size_t " << ivName << " = " << lbName << " + __gid * " << stepName << ";\n";
+
+      Region& forRegion = forOp.getRegion();
+      auto regionOps = forRegion.getOps();
+
+      bool prevParallel = emitter.isInParallelLoop();
+      emitter.setInParallelLoop(true);
+
+      for (auto it = regionOps.begin(); std::next(it) != regionOps.end(); ++it) {
+         if (failed(emitter.emitOperation(*it, /*trailingSemicolon=*/true)))
+            return failure();
+      }
+
+      emitter.setInParallelLoop(prevParallel);
+
+      os.unindent() << "}\n";
+      os.unindent() << "});\n";
+      os << "cudaDeviceSynchronize();\n";
+      os.unindent() << "}\n";
+      os.unindent() << "}\n";
+      return success();
    }
 
    os << "for (";

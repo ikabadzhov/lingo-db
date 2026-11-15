@@ -1,4 +1,5 @@
 #include "lingodb/runtime/SimpleState.h"
+#include "lingodb/runtime/CudaMemory.h"
 #include "lingodb/utility/Tracer.h"
 #include <iostream>
 namespace {
@@ -8,8 +9,8 @@ static lingodb::utility::Tracer::Event mergeEvent("SimpleState", "merge");
 uint8_t* lingodb::runtime::SimpleState::create(size_t sizeOfType) {
    utility::Tracer::Trace trace(createEvent);
    auto* executionContext = runtime::getCurrentExecutionContext();
-   uint8_t* res = (uint8_t*) malloc(sizeOfType);
-   executionContext->registerState({res, [](void* ptr) { free(ptr); }});
+   uint8_t* res = (uint8_t*) cudaAllocManaged(sizeOfType);
+   executionContext->registerState({res, [](void* ptr) { cudaFreeManaged(ptr); }});
    trace.stop();
    return res;
 }
