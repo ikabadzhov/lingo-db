@@ -64,3 +64,9 @@ target_link_libraries(sql-test PRIVATE ${COMMON_LIBS} Parquet::parquet_static)
 set_target_properties(sql-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_definitions(sql-test PRIVATE ${COMPILE_DEFS})
 
+# run-tpch-suite
+add_executable(run-tpch-suite run-tpch-suite.cpp)
+target_link_libraries(run-tpch-suite PRIVATE ${COMMON_LIBS} Parquet::parquet_static)
+set_target_properties(run-tpch-suite PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_definitions(run-tpch-suite PRIVATE ${COMPILE_DEFS})
+
