@@ -33,7 +33,18 @@
 
 #include <lingodb/compiler/Conversion/UtilToLLVM/Passes.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlow.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/MC/TargetRegistry.h>
 int main(int argc, char** argv) {
+   llvm::InitializeNativeTarget();
+   llvm::InitializeNativeTargetAsmPrinter();
+   LLVMInitializeRISCVTarget();
+   LLVMInitializeRISCVTargetInfo();
+   LLVMInitializeRISCVTargetMC();
+   LLVMInitializeRISCVAsmParser();
+   LLVMInitializeRISCVAsmPrinter();
+   llvm::cl::AddExtraVersionPrinter(llvm::TargetRegistry::printRegisteredTargetsForVersion);
    using namespace lingodb::compiler::dialect;
 
    if (argc == 2 && std::string(argv[1]) == "--features") {
