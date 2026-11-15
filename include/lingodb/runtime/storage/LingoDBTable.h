@@ -3,6 +3,7 @@
 
 #include "TableStorage.h"
 #include "lingodb/catalog/TableCatalogEntry.h"
+#include "lingodb/runtime/GPUHashTable.hpp"
 
 #include <functional>
 #include <string>
@@ -48,8 +49,10 @@ class LingoDBTable : public TableStorage {
    ColumnStatisticsMap columnStatistics;
    size_t numRows;
    bool loaded = false;
+   std::unordered_map<size_t, std::shared_ptr<GPUHashTable>> gpuHashTables;
    //todo: somehow we must be aware of the indices that are built on this table, and update them...
    public:
+   GPUHashTable* getOrCreateGPUHashTable(size_t colIndex);
    LingoDBTable(std::string fileName, std::shared_ptr<arrow::Schema> schema);
    LingoDBTable(std::string fileName, std::shared_ptr<arrow::Schema> schema, size_t numRows, catalog::Sample sample, ColumnStatisticsMap columnStatistics) : persist(false), fileName(std::move(fileName)), sample(std::move(sample)), schema(std::move(schema)), columnStatistics(std::move(columnStatistics)), numRows(numRows) {}
    void setPersist(bool persist) {

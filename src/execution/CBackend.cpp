@@ -80,6 +80,7 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
                     "#include <math.h>\n"
                     "#include \"lingodb/runtime/helpers.h\"\n"
                     "#include \"lingodb/runtime/Buffer.h\"\n"
+                    "#include \"lingodb/runtime/GPUHashTable.hpp\"\n"
                     "namespace runtime=lingodb::runtime;\n"
                     "namespace std {\n"
                     "template <>\n"

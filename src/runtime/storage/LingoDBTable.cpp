@@ -13,6 +13,7 @@
 #include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include "lingodb/runtime/CudaMemory.h"
+#include "lingodb/runtime/GPUHashTable.hpp"
 
 
 #include <algorithm>
@@ -415,6 +416,41 @@ void LingoDBTable::ensureLoaded() {
          sample = createSample(tableData);
       }
    }
+}
+GPUHashTable* LingoDBTable::getOrCreateGPUHashTable(size_t colIndex) {
+   ensureLoaded();
+   auto it = gpuHashTables.find(colIndex);
+   if (it != gpuHashTables.end()) {
+      return it->second.get();
+   }
+   auto ht = std::shared_ptr<GPUHashTable>(GPUHashTable::create(numRows), GPUHashTable::destroy);
+   int64_t rowOffset = 0;
+   auto typeId = schema->field(colIndex)->type()->id();
+   for (const auto& chunk : tableData) {
+      const auto* arrView = chunk.getArrayView(colIndex);
+      if (arrView && arrView->buffers && arrView->nBuffers > 1 && arrView->buffers[1]) {
+         if (typeId == arrow::Type::INT32 || typeId == arrow::Type::DATE32) {
+            const int32_t* colData = reinterpret_cast<const int32_t*>(arrView->buffers[1]);
+            for (size_t r = 0; r < chunk.getNumRows(); ++r) {
+               ht->insert(static_cast<int64_t>(colData[r]), rowOffset + static_cast<int64_t>(r));
+            }
+         } else if (typeId == arrow::Type::INT64) {
+            const int64_t* colData = reinterpret_cast<const int64_t*>(arrView->buffers[1]);
+            for (size_t r = 0; r < chunk.getNumRows(); ++r) {
+               ht->insert(colData[r], rowOffset + static_cast<int64_t>(r));
+            }
+         } else {
+            const int32_t* colData = reinterpret_cast<const int32_t*>(arrView->buffers[1]);
+            for (size_t r = 0; r < chunk.getNumRows(); ++r) {
+               ht->insert(static_cast<int64_t>(colData[r]), rowOffset + static_cast<int64_t>(r));
+            }
+         }
+      }
+      rowOffset += static_cast<int64_t>(chunk.getNumRows());
+   }
+   auto* ptr = ht.get();
+   gpuHashTables[colIndex] = std::move(ht);
+   return ptr;
 }
 void LingoDBTable::serialize(lingodb::utility::Serializer& serializer) const {
    serializer.writeProperty(1, fileName);
