@@ -28,9 +28,11 @@
 
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h"
 #include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -239,6 +241,13 @@ class LLVMBackend {
          // AArch64 cannot emit absolute relocations in shared objects.
          // Enforce PIC so LLVM lowers globals via GOT instead of MOVW_UABS_*.
          tmBuilderOrError->setRelocationModel(llvm::Reloc::PIC_);
+#elif defined(__riscv)
+         // RISC-V RuntimeDyld does not support linker relaxation (causes
+         // "LLVM ERROR: Unimplemented reloc type: 54", i.e. R_RISCV_SET8).
+         // Disable relaxation and enforce PIC / Medium code model for JIT execution.
+         tmBuilderOrError->addFeatures({"-relax"});
+         tmBuilderOrError->setRelocationModel(llvm::Reloc::PIC_);
+         tmBuilderOrError->setCodeModel(llvm::CodeModel::Medium);
 #endif
 
          auto tmOrError = tmBuilderOrError->createTargetMachine();
@@ -299,9 +308,10 @@ class LLVMBackend {
       // process and dynamically linked libraries.
       auto objectLinkingLayerCreator = [&](llvm::orc::ExecutionSession& session,
                                            const llvm::Triple& tt) {
-#if defined(__aarch64__) && defined(__linux__) && ASAN_ACTIVE
+#if (defined(__aarch64__) && defined(__linux__) && ASAN_ACTIVE) || defined(__riscv)
          // linux + aarch64 + ASAN requires llvm::jitlink::InProcessMemoryManager
-         // as RTDyldObjectLinkingLayer is incompatible with ASAN under linux + aarch64
+         // as RTDyldObjectLinkingLayer is incompatible with ASAN under linux + aarch64.
+         // RISC-V also requires ObjectLinkingLayer (JITLink) for full ELF relocation support.
          auto objectLayer = std::make_unique<llvm::orc::ObjectLinkingLayer>(
             session,
             cantFail(llvm::jitlink::InProcessMemoryManager::Create()));
@@ -744,17 +754,6 @@ class GPULLVMBackend : public execution::ExecutionBackend {
       auto startJIT = std::chrono::high_resolution_clock::now();
       // Libraries that we'll pass to the LLVMBackend for loading.
       llvm::SmallVector<llvm::StringRef, 4> requiredLibs = {CUDA_RUNTIME_LIB};
-
-      auto tmBuilderOrError = llvm::orc::JITTargetMachineBuilder::detectHost();
-      if (!tmBuilderOrError) {
-         llvm::errs() << "Failed to create a JITTargetMachineBuilder for the host\n";
-         assert(false && "should not happen");
-      }
-      auto tmOrError = tmBuilderOrError->createTargetMachine();
-      if (!tmOrError) {
-         llvm::errs() << "Failed to create a TargetMachine for the host\n";
-         assert(false && "should not happen");
-      }
 
       auto maybeEngine = LLVMBackend::create(moduleOp, {.llvmModuleBuilder = convertFn, .transformer = optimizeFn, .jitCodeGenOptLevel = llvm::CodeGenOptLevel::Default, .sharedLibPaths = requiredLibs, .enableObjectDump = false});
       if (!maybeEngine) {
