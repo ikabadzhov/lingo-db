@@ -15,6 +15,7 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <regex>
 #include <spawn.h>
 
@@ -65,9 +66,14 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
 
       translatedModule = std::regex_replace(translatedModule, r, "extern \"C\" void mainFunc() {");
 
+      // Use a stable content hash so the AdaptiveCpp JIT kernel cache is reused
+      // across runs (same IR → same hash → same .so path → cache hit).
+      // Append a per-process module counter to handle multiple distinct modules
+      // within one session, while keeping the name stable across restarts.
       static std::atomic<uint64_t> moduleCounter{0};
       uint64_t modId = moduleCounter.fetch_add(1);
-      std::string baseName = "c-backend-" + std::to_string(getpid()) + "-" + std::to_string(modId);
+      uint64_t irHash = std::hash<std::string>{}(translatedModule);
+      std::string baseName = "c-backend-" + std::to_string(irHash) + "-" + std::to_string(modId);
       std::string cppPath = currPath + "/" + baseName + ".cpp";
       std::string soPath = currPath + "/" + baseName + ".so";
 
