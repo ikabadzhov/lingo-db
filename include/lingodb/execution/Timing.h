@@ -71,6 +71,7 @@ class TimingPrinter : public TimingProcessor {
             std::cout << std::setw(headerLen) << "";
          }
       }
+      std::cout << std::endl;
    }
 };
 } // namespace lingodb::execution
