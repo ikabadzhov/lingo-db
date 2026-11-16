@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
    std::string backend = "c";
    std::string queryStr;
    std::string queryFile;
+   size_t numThreads = 0;
    std::string parquetDir;
    if (const char* env = std::getenv("PARQUET_DIR")) {
       parquetDir = env;
@@ -119,9 +120,13 @@ int main(int argc, char** argv) {
    for (int i = 1; i < argc; ++i) {
       std::string arg = argv[i];
       if (arg == "--help" || arg == "-h") {
-         std::cout << "Usage: sql-test [--backend=<c|gpu|llvm>] [--query=<file>] [--parquet-dir=<path>] [--db-dir=<path>]\n"
-                   << "Environment variables: PARQUET_DIR (or TPCH_PARQUET_DIR), ACPP_BIN, ACPP_DIR\n";
+         std::cout << "Usage: sql-test [--backend=<c|gpu|llvm|speed|cheap>] [--threads=<N>] [--query=<file>] [--parquet-dir=<path>] [--db-dir=<path>]\n"
+                   << "Environment variables: PARQUET_DIR (or TPCH_PARQUET_DIR), LINGODB_PARALLELISM, ACPP_BIN, ACPP_DIR\n";
          return 0;
+      } else if (arg.starts_with("--threads=")) {
+         numThreads = std::stoul(arg.substr(10));
+      } else if (arg == "--threads" && i + 1 < argc) {
+         numThreads = std::stoul(argv[++i]);
       } else if (arg.starts_with("--backend=")) {
          backend = arg.substr(10);
       } else if (arg == "--backend" && i + 1 < argc) {
@@ -173,10 +178,12 @@ int main(int argc, char** argv) {
       runMode = execution::ExecutionMode::DEFAULT;
    } else if (backend == "speed" || backend == "SPEED") {
       runMode = execution::ExecutionMode::SPEED;
+   } else if (backend == "cheap" || backend == "CHEAP") {
+      runMode = execution::ExecutionMode::CHEAP;
    }
 
    auto startLoad = std::chrono::high_resolution_clock::now();
-   auto scheduler = scheduler::startScheduler();
+   auto scheduler = scheduler::startScheduler(numThreads);
    std::shared_ptr<runtime::Session> session;
    if (!parquetDir.empty() && std::filesystem::exists(parquetDir)) {
       session = runtime::Session::createSession(parquetDir, false);
@@ -192,6 +199,7 @@ int main(int argc, char** argv) {
 
    auto startQuery = std::chrono::high_resolution_clock::now();
    auto queryExecutionConfig = execution::createQueryExecutionConfig(runMode, true);
+   queryExecutionConfig->timingProcessor = std::make_unique<execution::TimingPrinter>(queryFile);
    auto executer = execution::QueryExecuter::createDefaultExecuter(std::move(queryExecutionConfig), *session);
    executer->fromData(queryStr);
    scheduler::awaitEntryTask(std::make_unique<execution::QueryExecutionTask>(std::move(executer)));
