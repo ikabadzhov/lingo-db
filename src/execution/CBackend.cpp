@@ -12,10 +12,12 @@
 #include "mlir/Pass/PassManager.h"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <regex>
 #include <spawn.h>
 
@@ -259,6 +261,7 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
 #endif
       }
 
+      auto startCompile = std::chrono::high_resolution_clock::now();
       auto* pPipe = ::popen(cmd.c_str(), "r");
       if (pPipe == nullptr) {
          error.emit() << "Could not compile query module statically (Pipe could not be opened)";
@@ -272,6 +275,10 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
          result.append(buffer.data(), bytes);
       }
       auto rc = ::pclose(pPipe);
+      auto endCompile = std::chrono::high_resolution_clock::now();
+      double compileMs = std::chrono::duration_cast<std::chrono::microseconds>(endCompile - startCompile).count() / 1000.0;
+      std::cout << "[Timer] acpp compilation: " << compileMs << " ms" << std::endl;
+
       if (WEXITSTATUS(rc)) {
          error.emit() << "Could not compile query module statically:\n" << result;
          std::filesystem::remove(cppPath);
@@ -294,7 +301,11 @@ class DefaultCBackend : public lingodb::execution::ExecutionBackend {
          std::filesystem::remove(soPath);
          return;
       }
+      auto startRun = std::chrono::high_resolution_clock::now();
       mainFunc();
+      auto endRun = std::chrono::high_resolution_clock::now();
+      double runMs = std::chrono::duration_cast<std::chrono::microseconds>(endRun - startRun).count() / 1000.0;
+      std::cout << "[Timer] Kernel execution time: " << runMs << " ms" << std::endl;
       // Note: Do not dlclose(handle) because AdaptiveCpp registers runtime kernel descriptors
       // and asynchronous queues that must remain valid for subsequent kernel calls.
       // The shared library has a unique path per query (modId), so each query gets its own handle.

@@ -175,6 +175,7 @@ int main(int argc, char** argv) {
       runMode = execution::ExecutionMode::SPEED;
    }
 
+   auto startLoad = std::chrono::high_resolution_clock::now();
    auto scheduler = scheduler::startScheduler();
    std::shared_ptr<runtime::Session> session;
    if (!parquetDir.empty() && std::filesystem::exists(parquetDir)) {
@@ -185,11 +186,18 @@ int main(int argc, char** argv) {
    } else {
       session = runtime::Session::createSession();
    }
+   auto endLoad = std::chrono::high_resolution_clock::now();
+   double loadMs = std::chrono::duration_cast<std::chrono::microseconds>(endLoad - startLoad).count() / 1000.0;
+   std::cout << "[Timer] Parquet tables registration: " << loadMs << " ms" << std::endl;
 
+   auto startQuery = std::chrono::high_resolution_clock::now();
    auto queryExecutionConfig = execution::createQueryExecutionConfig(runMode, true);
    auto executer = execution::QueryExecuter::createDefaultExecuter(std::move(queryExecutionConfig), *session);
    executer->fromData(queryStr);
    scheduler::awaitEntryTask(std::make_unique<execution::QueryExecutionTask>(std::move(executer)));
+   auto endQuery = std::chrono::high_resolution_clock::now();
+   double queryMs = std::chrono::duration_cast<std::chrono::microseconds>(endQuery - startQuery).count() / 1000.0;
+   std::cout << "[Timer] Total Query (pipeline + execution): " << queryMs << " ms" << std::endl;
 
    std::quick_exit(0);
    return 0;
